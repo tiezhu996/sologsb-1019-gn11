@@ -3,6 +3,7 @@ import { createStore, reconcile, unwrap } from 'solid-js/store';
 import { seedState } from '../data/seed';
 import type { CoderId, CodingState, PersistedEnvelope, Segment, Theme } from '../types';
 import { readEnvelope, writeEnvelope } from '../utils/db';
+import { joinSegmentTexts, splitSentences } from '../utils/segments';
 
 const STORAGE_KEY = 'sologsb-1019-state-v1';
 const TAB_ID = crypto.randomUUID();
@@ -231,6 +232,66 @@ export function useCodingStore() {
     });
   };
 
+  // 拆分或合并后把 order 重排为连续整数，保证列表与导出的编号、顺序一致。
+  const normalizeSegmentOrder = (segments: Segment[]) => {
+    [...segments].sort((a, b) => a.order - b.order).forEach((segment, index) => { segment.order = index; });
+  };
+
+  const splitSegment = (segmentId: string, movedIndexes: number[]) => {
+    const segment = state.segments.find((item) => item.id === segmentId);
+    if (!segment) return;
+    const sentenceCount = splitSentences(segment.text).length;
+    const targets = [...new Set(movedIndexes)].filter((index) => index >= 0 && index < sentenceCount);
+    if (!targets.length || targets.length === sentenceCount) return;
+    transaction('拆分片段', `从 ${segment.time} 片段拆出 ${targets.length} 句为新片段`, (draft) => {
+      const source = draft.segments.find((item) => item.id === segmentId);
+      if (!source) return;
+      const sentences = splitSentences(source.text);
+      const moved = new Set(targets);
+      const kept = sentences.filter((_, index) => !moved.has(index));
+      const movedText = sentences.filter((_, index) => moved.has(index));
+      if (!kept.length || !movedText.length) return;
+      const newSegment: Segment = {
+        id: `s-${crypto.randomUUID()}`,
+        transcriptId: source.transcriptId,
+        order: source.order + 0.5,
+        speaker: source.speaker,
+        time: source.time,
+        text: movedText.join(''),
+        assignments: { A: [...source.assignments.A], B: [...source.assignments.B] },
+        note: source.note
+      };
+      source.text = kept.join('');
+      draft.segments.push(newSegment);
+      normalizeSegmentOrder(draft.segments);
+      draft.activeSegmentId = newSegment.id;
+    });
+  };
+
+  const mergeSegments = (firstId: string, secondId: string) => {
+    const first = state.segments.find((item) => item.id === firstId);
+    const second = state.segments.find((item) => item.id === secondId);
+    if (!first || !second || first.transcriptId !== second.transcriptId) return;
+    const siblings = state.segments
+      .filter((item) => item.transcriptId === first.transcriptId)
+      .sort((a, b) => a.order - b.order);
+    if (siblings.findIndex((item) => item.id === firstId) !== siblings.findIndex((item) => item.id === secondId) - 1) return;
+    transaction('合并片段', `合并 ${first.time} 与 ${second.time} 两段`, (draft) => {
+      const kept = draft.segments.find((item) => item.id === firstId);
+      const removed = draft.segments.find((item) => item.id === secondId);
+      if (!kept || !removed) return;
+      kept.text = joinSegmentTexts(kept.text, removed.text);
+      if (kept.speaker !== removed.speaker) kept.speaker = `${kept.speaker} / ${removed.speaker}`;
+      (['A', 'B'] as CoderId[]).forEach((coder) => {
+        kept.assignments[coder] = [...new Set([...kept.assignments[coder], ...removed.assignments[coder]])];
+      });
+      kept.note = [kept.note, removed.note].filter(Boolean).join('；');
+      draft.segments = draft.segments.filter((item) => item.id !== secondId);
+      normalizeSegmentOrder(draft.segments);
+      draft.activeSegmentId = firstId;
+    });
+  };
+
   const importTranscript = (raw: string, title: string, participant: string, sourceName: string) => {
     const transcriptId = `tr-${crypto.randomUUID()}`;
     const rows = parseTranscript(raw, participant);
@@ -267,8 +328,12 @@ export function useCodingStore() {
     const themeMap = new Map(state.themes.map((theme) => [theme.id, theme]));
     if (format === 'json') return JSON.stringify({ exportedAt: new Date().toISOString(), ...cloneState(state) }, null, 2);
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
-    state.segments.forEach((segment) => {
+    const rows = [['序号', '访谈', '片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
+    const transcriptTitles = new Map(state.transcripts.map((transcript) => [transcript.id, transcript.title]));
+    const sequences = new Map<string, number>();
+    [...state.segments].sort((a, b) => a.order - b.order).forEach((segment) => {
+      const sequence = (sequences.get(segment.transcriptId) ?? 0) + 1;
+      sequences.set(segment.transcriptId, sequence);
       (['A', 'B'] as CoderId[]).forEach((coder) => {
         const name = coder === 'A' ? state.coderA : state.coderB;
         const themeIds = segment.assignments[coder];
@@ -281,7 +346,7 @@ export function useCodingStore() {
           }
           return names.join(' / ');
         }) : ['未编码'];
-        rows.push([segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
+        rows.push([String(sequence), transcriptTitles.get(segment.transcriptId) ?? '', segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
       });
     });
     return `\uFEFF${rows.join('\n')}`;
@@ -333,6 +398,8 @@ export function useCodingStore() {
     mergeThemes,
     splitTheme,
     updateSegment,
+    splitSegment,
+    mergeSegments,
     importTranscript,
     addExample,
     exportCoding,
