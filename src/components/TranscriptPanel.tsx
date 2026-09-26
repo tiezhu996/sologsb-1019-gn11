@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createSignal } from 'solid-js';
 import { Button, Checkbox, Chip, Divider, Paper, Typography } from '@suid/material';
 import type { useCodingStore } from '../store/coding-store';
+import { SplitSegmentDialog } from './SegmentDialogs';
 
 type Store = ReturnType<typeof useCodingStore>;
 
@@ -8,11 +9,19 @@ export default function TranscriptPanel(props: { store: Store }) {
   const [query, setQuery] = createSignal('');
   const [selected, setSelected] = createSignal<string[]>([]);
   const [batchTheme, setBatchTheme] = createSignal('');
+  const [splitOpen, setSplitOpen] = createSignal(false);
 
-  const segments = createMemo(() => props.store.state.segments
+  const transcriptSegments = createMemo(() => props.store.state.segments
     .filter((segment) => segment.transcriptId === props.store.state.activeTranscriptId)
-    .filter((segment) => `${segment.speaker} ${segment.text}`.toLowerCase().includes(query().toLowerCase()))
     .sort((a, b) => a.order - b.order));
+
+  const segments = createMemo(() => transcriptSegments()
+    .filter((segment) => `${segment.speaker} ${segment.text}`.toLowerCase().includes(query().toLowerCase())));
+
+  const nextOf = (id: string) => {
+    const list = transcriptSegments();
+    return list[list.findIndex((segment) => segment.id === id) + 1];
+  };
 
   const toggleSelected = (id: string) => {
     setSelected((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]);
@@ -96,10 +105,22 @@ export default function TranscriptPanel(props: { store: Store }) {
                 <div class="chip-line"><For each={themeNames()}>{(name) => <Chip size="small" label={name} />}</For></div>
               </Show>
               <Show when={segment.note}><div class="segment-note">编码备忘：{segment.note}</div></Show>
+              <Show when={isActive()}>
+                <div class="segment-actions" onClick={(event) => event.stopPropagation()}>
+                  <button class="link-button" onClick={() => setSplitOpen(true)}>拆分片段…</button>
+                  <button
+                    class="link-button"
+                    disabled={!nextOf(segment.id)}
+                    title={nextOf(segment.id) ? `与下一段（${nextOf(segment.id)!.speaker} ${nextOf(segment.id)!.time}）合并，主题判断并集去重` : '已是最后一段'}
+                    onClick={() => props.store.mergeWithNext(segment.id)}
+                  >与下一段合并</button>
+                </div>
+              </Show>
             </article>
           );
         }}</For>
       </div>
+      <SplitSegmentDialog store={props.store} open={splitOpen()} onClose={() => setSplitOpen(false)} />
     </Paper>
   );
 }

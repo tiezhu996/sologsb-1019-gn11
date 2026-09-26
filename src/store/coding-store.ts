@@ -78,6 +78,21 @@ const buildTreeOrder = (themes: Theme[]) => {
   return result;
 };
 
+export const splitSentences = (text: string): string[] => {
+  const parts = text.split(/(?<=[。！？；…!?;])|\n+/).map((part) => part.trim()).filter(Boolean);
+  return parts.length ? parts : [text.trim()].filter(Boolean);
+};
+
+const normalizeOrders = (draft: CodingState, transcriptId: string) => {
+  const scoped = draft.segments.filter((segment) => segment.transcriptId === transcriptId).sort((a, b) => a.order - b.order);
+  scoped.forEach((segment, index) => { segment.order = index; });
+  const transcriptIndex = new Map(draft.transcripts.map((transcript, index) => [transcript.id, index]));
+  draft.segments = [...draft.segments].sort((a, b) => {
+    const byTranscript = (transcriptIndex.get(a.transcriptId) ?? 0) - (transcriptIndex.get(b.transcriptId) ?? 0);
+    return byTranscript !== 0 ? byTranscript : a.order - b.order;
+  });
+};
+
 const parseTranscript = (raw: string, speakerFallback: string): Array<Pick<Segment, 'time' | 'speaker' | 'text'>> => {
   const rows = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   return rows.map((line, index) => {
@@ -231,6 +246,62 @@ export function useCodingStore() {
     });
   };
 
+  const splitSegment = (segmentId: string, movedSentences: string[]) => {
+    const segment = state.segments.find((item) => item.id === segmentId);
+    if (!segment) return false;
+    const sentences = splitSentences(segment.text);
+    const moved = sentences.filter((sentence) => movedSentences.includes(sentence));
+    const remaining = sentences.filter((sentence) => !movedSentences.includes(sentence));
+    if (!moved.length || !remaining.length) return false;
+    const freshId = `s-${crypto.randomUUID()}`;
+    transaction('拆分片段', `拆出 ${moved.length} 句为新片段`, (draft) => {
+      const current = draft.segments.find((item) => item.id === segmentId);
+      if (!current) return;
+      current.text = remaining.join('');
+      draft.segments.forEach((item) => {
+        if (item.transcriptId === current.transcriptId && item.order > current.order) item.order += 1;
+      });
+      draft.segments.push({
+        id: freshId,
+        transcriptId: current.transcriptId,
+        order: current.order + 1,
+        speaker: current.speaker,
+        time: current.time,
+        text: moved.join(''),
+        assignments: { A: [...current.assignments.A], B: [...current.assignments.B] },
+        note: current.note
+      });
+      normalizeOrders(draft, current.transcriptId);
+      draft.activeSegmentId = freshId;
+    });
+    return true;
+  };
+
+  const mergeWithNext = (segmentId: string) => {
+    const segment = state.segments.find((item) => item.id === segmentId);
+    if (!segment) return false;
+    const siblings = state.segments
+      .filter((item) => item.transcriptId === segment.transcriptId)
+      .sort((a, b) => a.order - b.order);
+    const index = siblings.findIndex((item) => item.id === segmentId);
+    const next = siblings[index + 1];
+    if (!next) return false;
+    transaction('合并片段', `合并相邻两段（${segment.speaker} ${segment.time} 起）`, (draft) => {
+      const first = draft.segments.find((item) => item.id === segmentId);
+      const second = draft.segments.find((item) => item.id === next.id);
+      if (!first || !second) return;
+      first.text = first.speaker === second.speaker ? `${first.text}${second.text}` : `${first.text}\n${second.speaker}：${second.text}`;
+      (['A', 'B'] as CoderId[]).forEach((coder) => {
+        first.assignments[coder] = [...new Set([...first.assignments[coder], ...second.assignments[coder]])];
+      });
+      first.note = [first.note, second.note].filter(Boolean).join('；');
+      draft.segments = draft.segments.filter((item) => item.id !== second.id);
+      normalizeOrders(draft, first.transcriptId);
+      draft.activeSegmentId = first.id;
+    });
+    return true;
+  };
+
   const importTranscript = (raw: string, title: string, participant: string, sourceName: string) => {
     const transcriptId = `tr-${crypto.randomUUID()}`;
     const rows = parseTranscript(raw, participant);
@@ -267,8 +338,17 @@ export function useCodingStore() {
     const themeMap = new Map(state.themes.map((theme) => [theme.id, theme]));
     if (format === 'json') return JSON.stringify({ exportedAt: new Date().toISOString(), ...cloneState(state) }, null, 2);
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
-    state.segments.forEach((segment) => {
+    const transcriptIndex = new Map(state.transcripts.map((transcript, index) => [transcript.id, index]));
+    const sorted = [...state.segments].sort((a, b) => {
+      const byTranscript = (transcriptIndex.get(a.transcriptId) ?? 0) - (transcriptIndex.get(b.transcriptId) ?? 0);
+      return byTranscript !== 0 ? byTranscript : a.order - b.order;
+    });
+    const counters = new Map<string, number>();
+    const rows = [['访谈', '片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
+    sorted.forEach((segment) => {
+      const number = (counters.get(segment.transcriptId) ?? 0) + 1;
+      counters.set(segment.transcriptId, number);
+      const transcriptTitle = state.transcripts.find((item) => item.id === segment.transcriptId)?.title ?? segment.transcriptId;
       (['A', 'B'] as CoderId[]).forEach((coder) => {
         const name = coder === 'A' ? state.coderA : state.coderB;
         const themeIds = segment.assignments[coder];
@@ -281,7 +361,7 @@ export function useCodingStore() {
           }
           return names.join(' / ');
         }) : ['未编码'];
-        rows.push([segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
+        rows.push([transcriptTitle, `#${number}`, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
       });
     });
     return `\uFEFF${rows.join('\n')}`;
@@ -333,6 +413,8 @@ export function useCodingStore() {
     mergeThemes,
     splitTheme,
     updateSegment,
+    splitSegment,
+    mergeWithNext,
     importTranscript,
     addExample,
     exportCoding,
